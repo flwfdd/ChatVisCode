@@ -501,7 +501,7 @@ function Flow() {
       <div className="flex flex-col min-w-64 max-w-64 h-auto shadow-lg rounded-r-lg">
         <div className='p-4 pb-0'>
           <div className="flex justify-between items-center mb-2">
-            <div className="text-xl font-bold">Chat Vis Code</div>
+            <div className="text-xl font-bold">ChatVisCode</div>
             <Button variant="outline" size="icon" onClick={() => setTheme(theme === "light" ? "dark" : theme === "dark" ? "system" : "light")}>
               {theme === "light" ? <Sun /> : theme === "dark" ? <Moon /> : <SunMoon />}
             </Button>

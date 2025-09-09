@@ -192,24 +192,24 @@ function AICopilotDialog({
     };
 
     // Define tool parameter schemas
-    const EditNodeParamsSchema = z.object({
+    const EditNodesParamsSchema = z.object({
       flowId: z.string().describe('ID of the flow to edit.'),
-      node: NodeDSLSchema.describe('Node to create or update')
+      nodes: z.array(NodeDSLSchema).describe('Nodes to create or update')
     });
 
-    const RemoveNodeParamsSchema = z.object({
+    const RemoveNodesParamsSchema = z.object({
       flowId: z.string().describe('ID of the flow to edit.'),
-      nodeId: z.string().describe('ID of the node to remove')
+      nodeIds: z.array(z.string()).describe('IDs of the nodes to remove')
     });
 
-    const EditEdgeParamsSchema = z.object({
+    const EditEdgesParamsSchema = z.object({
       flowId: z.string().describe('ID of the flow to edit.'),
-      edge: EdgeDSLSchema.describe('Edge to create or update')
+      edges: z.array(EdgeDSLSchema).describe('Edges to create or update')
     });
 
-    const RemoveEdgeParamsSchema = z.object({
+    const RemoveEdgesParamsSchema = z.object({
       flowId: z.string().describe('ID of the flow to edit.'),
-      edgeId: z.string().describe('ID of the edge to remove')
+      edgeIds: z.array(z.string()).describe('IDs of the edges to remove')
     });
 
     const EditFlowParamsSchema = z.object({
@@ -226,9 +226,9 @@ function AICopilotDialog({
     });
 
     const editNodeTool = createExecutableTool(
-      'edit_node',
-      'Create or edit a node in the flow. If node ID exists, it will be replaced; if not, a new node will be created.',
-      EditNodeParamsSchema,
+      'edit_nodes',
+      'Create or edit nodes in the flow. If node ID exists, it will be replaced; if not, a new node will be created.',
+      EditNodesParamsSchema,
       async (args) => {
         const currentDSL = getCurrentDSL();
         const flowId = args.flowId;
@@ -239,35 +239,34 @@ function AICopilotDialog({
           throw new Error(`Flow with id "${flowId}" not found`);
         }
 
-        // Find existing node index
-        const existingIndex = targetFlow.nodes.findIndex((n: { id: string }) => n.id === args.node.id);
+        for (const node of args.nodes) {
+          // Find existing node index
+          const existingIndex = targetFlow.nodes.findIndex((n: { id: string }) => n.id === node.id);
 
-        if (existingIndex >= 0) {
-          // Replace existing node
-          targetFlow.nodes[existingIndex] = {
-            ...args.node,
-            position: args.node.position || { x: 0, y: 0 }
-          };
-          const result = updateDSLAndEditor(currentDSL, `Node "${args.node.id}" updated successfully`);
-          setNodeReviewed(flowId, args.node.id, false);
-          return result;
-        } else {
-          // Add new node
-          targetFlow.nodes.push({
-            ...args.node,
-            position: args.node.position || { x: 0, y: 0 }
-          });
-          const result = updateDSLAndEditor(currentDSL, `Node "${args.node.id}" created successfully`);
-          setNodeReviewed(flowId, args.node.id, false);
-          return result;
+          if (existingIndex >= 0) {
+            // Replace existing node
+            targetFlow.nodes[existingIndex] = {
+              ...node,
+              position: node.position || { x: 0, y: 0 }
+            };
+          } else {
+            // Add new node
+            targetFlow.nodes.push({
+              ...node,
+              position: node.position || { x: 0, y: 0 }
+            });
+          }
         }
+        const result = updateDSLAndEditor(currentDSL, `Nodes "${args.nodes.map((node) => node.id).join(', ')}" updated successfully`);
+        args.nodes.forEach((node) => setNodeReviewed(flowId, node.id, false));
+        return result;
       }
     );
 
     const removeNodeTool = createExecutableTool(
-      'remove_node',
-      'Remove a node from the flow and all its connected edges',
-      RemoveNodeParamsSchema,
+      'remove_nodes',
+      'Remove nodes from the flow and all their connected edges',
+      RemoveNodesParamsSchema,
       async (args) => {
         const currentDSL = getCurrentDSL();
         const flowId = args.flowId;
@@ -278,27 +277,29 @@ function AICopilotDialog({
           throw new Error(`Flow with id "${flowId}" not found`);
         }
 
-        // Find and remove the node
-        const nodeIndex = targetFlow.nodes.findIndex((n: { id: string }) => n.id === args.nodeId);
-        if (nodeIndex === -1) {
-          throw new Error(`Node with id "${args.nodeId}" not found`);
+        for (const nodeId of args.nodeIds) {
+          // Find and remove the node
+          const nodeIndex = targetFlow.nodes.findIndex((n: { id: string }) => n.id === nodeId);
+          if (nodeIndex === -1) {
+            throw new Error(`Node with id "${nodeId}" not found`);
+          }
+
+          targetFlow.nodes.splice(nodeIndex, 1);
+
+          // Remove all edges connected to this node
+          targetFlow.edges = targetFlow.edges.filter((e: { source: { nodeId: string }, target: { nodeId: string } }) =>
+            e.source.nodeId !== nodeId && e.target.nodeId !== nodeId
+          );
         }
 
-        targetFlow.nodes.splice(nodeIndex, 1);
-
-        // Remove all edges connected to this node
-        targetFlow.edges = targetFlow.edges.filter((e: { source: { nodeId: string }, target: { nodeId: string } }) =>
-          e.source.nodeId !== args.nodeId && e.target.nodeId !== args.nodeId
-        );
-
-        return updateDSLAndEditor(currentDSL, `Node "${args.nodeId}" and its connected edges removed successfully`);
+        return updateDSLAndEditor(currentDSL, `Nodes "${args.nodeIds.join(', ')}" and their connected edges removed successfully`);
       }
     );
 
     const editEdgeTool = createExecutableTool(
-      'edit_edge',
-      'Create or edit an edge in the flow. If edge ID exists, it will be replaced; if not, a new edge will be created.',
-      EditEdgeParamsSchema,
+      'edit_edges',
+      'Create or edit edges in the flow. If edge ID exists, it will be replaced; if not, a new edge will be created.',
+      EditEdgesParamsSchema,
       async (args) => {
         const currentDSL = getCurrentDSL();
         const flowId = args.flowId;
@@ -309,26 +310,28 @@ function AICopilotDialog({
           throw new Error(`Flow with id "${flowId}" not found`);
         }
 
-        // Find existing edge index
-        const existingIndex = targetFlow.edges.findIndex((e: { id: string }) => e.id === args.edge.id);
+        for (const edge of args.edges) {
+          // Find existing edge index
+          const existingIndex = targetFlow.edges.findIndex((e: { id: string }) => e.id === edge.id);
 
-        if (existingIndex >= 0) {
-          // Replace existing edge
-          targetFlow.edges[existingIndex] = args.edge;
-          return updateDSLAndEditor(currentDSL, `Edge "${args.edge.id}" updated successfully`);
-        } else {
-          // Add new edge
-          targetFlow.edges.push(args.edge);
-          return updateDSLAndEditor(currentDSL, `Edge "${args.edge.id}" created successfully`);
+          if (existingIndex >= 0) {
+            // Replace existing edge
+            targetFlow.edges[existingIndex] = edge;
+          } else {
+            // Add new edge
+            targetFlow.edges.push(edge);
+          }
         }
+        const result = updateDSLAndEditor(currentDSL, `Edges "${args.edges.map((edge) => edge.id).join(', ')}" updated successfully`);
+        return result;
       }
     );
 
     // Create the remove_edge tool
     const removeEdgeTool = createExecutableTool(
       'remove_edge',
-      'Remove an edge from the flow',
-      RemoveEdgeParamsSchema,
+      'Remove edges from the flow',
+      RemoveEdgesParamsSchema,
       async (args) => {
         const currentDSL = getCurrentDSL();
         const flowId = args.flowId;
@@ -339,15 +342,17 @@ function AICopilotDialog({
           throw new Error(`Flow with id "${flowId}" not found`);
         }
 
-        // Find and remove the edge
-        const edgeIndex = targetFlow.edges.findIndex((e: { id: string }) => e.id === args.edgeId);
-        if (edgeIndex === -1) {
-          throw new Error(`Edge with id "${args.edgeId}" not found`);
+        for (const edgeId of args.edgeIds) {
+          // Find and remove the edge
+          const edgeIndex = targetFlow.edges.findIndex((e: { id: string }) => e.id === edgeId);
+          if (edgeIndex === -1) {
+            throw new Error(`Edge with id "${edgeId}" not found`);
+          }
+
+          targetFlow.edges.splice(edgeIndex, 1);
         }
 
-        targetFlow.edges.splice(edgeIndex, 1);
-
-        return updateDSLAndEditor(currentDSL, `Edge "${args.edgeId}" removed successfully`);
+        return updateDSLAndEditor(currentDSL, `Edge "${args.edgeIds.join(', ')}" removed successfully`);
       }
     );
 
