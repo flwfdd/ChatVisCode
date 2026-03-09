@@ -3,6 +3,7 @@ import {
   Background,
   BackgroundVariant,
   Controls,
+  ControlButton,
   Edge,
   MiniMap,
   Node,
@@ -14,7 +15,7 @@ import {
   Connection,
   NodeTypes,
 } from '@xyflow/react';
-import { EllipsisVertical, FileDown, FileUp, Loader, Moon, PanelLeftClose, PanelRightClose, PlayCircle, Plus, ScrollText, Sparkles, Sun, SunMoon } from "lucide-react";
+import { EllipsisVertical, FileDown, FileUp, LayoutDashboard, Loader, Moon, PanelLeftClose, PanelRightClose, PlayCircle, Plus, ScrollText, Sparkles, Sun, SunMoon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import '@xyflow/react/dist/style.css';
@@ -57,6 +58,7 @@ import { Separator } from '@/components/ui/separator';
 import { Textarea } from "@/components/ui/textarea";
 import configGlobal from "@/lib/config";
 import { defaultNodeRunState, dumpDSL, dumpFlow, IDSL, IEdge, IFlowNodeState, IFlowNodeType, INode, INodeConfig, INodeInput, INodeOutput, INodeState, INodeStateRun, INodeType, INodeWithPosition, IRunFlowStack, loadDSL, runFlow } from '@/lib/flow/flow';
+import { getLayoutedElements } from '@/lib/flow/layout';
 import { llmStream } from '@/lib/llm';
 import { generateId } from '@/lib/utils';
 import { toast } from 'sonner';
@@ -122,7 +124,7 @@ function Flow() {
   // ReactFlow
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-  const { screenToFlowPosition, updateNodeData, fitView } = useReactFlow();
+  const { screenToFlowPosition, updateNodeData, fitView, getNodes, getEdges } = useReactFlow();
 
   const [editingFlowId, setEditingFlowId] = useState<string>(initialFlowNodeType.id);
 
@@ -262,27 +264,71 @@ function Flow() {
       });
   }, [nodes, edges, updateNodeData, toINode, toIEdge]);
 
+  // 自动布局
+  const onLayout = useCallback((direction: 'TB' | 'LR' = 'TB') => {
+    const { nodes: layoutedNodes, edges: layoutedEdges } = getLayoutedElements(
+      nodes,
+      edges,
+      { direction }
+    );
+
+    setNodes([...layoutedNodes]);
+    setEdges([...layoutedEdges]);
+
+    window.requestAnimationFrame(() => {
+      fitView();
+    });
+  }, [nodes, edges, setNodes, setEdges, fitView]);
+
   // 处理Flow AI Dialog
   const handleOpenAICopilotDialog = useCallback(() => {
     setIsAICopilotDialogOpen(true);
   }, []);
 
   // 导入流
-  const importDSL = useCallback((dsl: IDSL) => {
+  const importDSL = useCallback((dsl: IDSL, autoLayout: boolean = false) => {
     const { mainFlowId, flowNodeTypes } = loadDSL(dsl, nodeTypeMap, newFlowNodeType);
     const mainFlow = flowNodeTypes.find(flow => flow.id === mainFlowId);
     if (!mainFlow) {
       throw new Error(`Main flow with ID "${mainFlowId}" not found`);
     }
-    setNodes(mainFlow.nodes.map(fromIDSLNode));
-    setEdges(mainFlow.edges.map(fromIDSLEdge));
+
+    const newNodes = mainFlow.nodes.map(fromIDSLNode);
+    const newEdges = mainFlow.edges.map(fromIDSLEdge);
+
+    setNodes(newNodes);
+    setEdges(newEdges);
     setFlowNodeTypes(flowNodeTypes);
-    fitView();
-  }, [nodeTypeMap, setNodes, setEdges, setFlowNodeTypes, fromIDSLNode, fromIDSLEdge, fitView]);
+
+    if (autoLayout) {
+      setTimeout(() => {
+        // 获取最新的节点（包含measured尺寸）
+        const currentNodes = getNodes();
+        const currentEdges = getEdges();
+
+        const { nodes: layoutedNodes, edges: layoutedEdges } = getLayoutedElements(
+          currentNodes.length > 0 ? currentNodes : newNodes,
+          currentEdges.length > 0 ? currentEdges : newEdges,
+          { direction: 'LR' }
+        );
+
+        setNodes([...layoutedNodes]);
+        setEdges([...layoutedEdges]);
+
+        window.requestAnimationFrame(() => {
+          fitView();
+        });
+      }, 100);
+    } else {
+      window.requestAnimationFrame(() => {
+        fitView();
+      });
+    }
+  }, [nodeTypeMap, setNodes, setEdges, setFlowNodeTypes, fromIDSLNode, fromIDSLEdge, fitView, getNodes, getEdges]);
 
   const handleDSLUpdate = useCallback((dsl: IDSL) => {
     try {
-      importDSL(dsl);
+      importDSL(dsl, true);
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       console.error("handleDSLUpdate error", errorMessage);
@@ -511,6 +557,10 @@ function Flow() {
               <PlayCircle />
               Run
             </Button>
+            <Button variant="outline" className="w-full" onClick={() => onLayout('LR')}>
+              <LayoutDashboard />
+              Auto Layout
+            </Button>
             <div className="flex flex-row gap-2">
               <Button variant="outline" className="flex-1" onClick={handleImportClick}>
                 <FileDown />
@@ -601,7 +651,11 @@ function Flow() {
         colorMode={isDarkMode ? 'dark' : 'light'}
         defaultEdgeOptions={{ style: { strokeWidth: 3 }, animated: true }}
       >
-        <Controls />
+        <Controls>
+          <ControlButton onClick={() => onLayout('LR')} title="Auto Layout">
+            <LayoutDashboard />
+          </ControlButton>
+        </Controls>
         <MiniMap />
         <Background variant={BackgroundVariant.Dots} />
       </ReactFlow>

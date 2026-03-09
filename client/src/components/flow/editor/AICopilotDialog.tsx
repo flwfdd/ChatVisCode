@@ -472,7 +472,6 @@ All changes must ensure the DSL:
 - A node can connect to zero or more input/output edges through handles, every handle has a unique key, which is defined strictly by the node type input/output schema or dynamically by the node config
 - Every output handle of a node (source of an edge) can connect to multiple input handles (targets of edges), but every input handle can only connect to one output handle (except the end node)
 - For some node types, the input/output handles are dynamic, you must make sure the handle keys are valid
-- Every node's size is about 400, you should consider the position to avoid overlap
 
 ## Edge Structure
 - An edge has a unique id, a source and a target

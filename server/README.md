@@ -11,7 +11,7 @@ uv sync
 
 2. Build the python runner image in `./docker`:
 ```bash
-docker build -f PythonRunnerDockerfile -t python-runner .
+docker build -f docker/PythonRunnerDockerfile -t python-runner .
 ```
 
 3. Create a `./.env` config file according to fields described in `./.env.example`. 
