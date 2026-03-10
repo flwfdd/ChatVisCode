@@ -1,7 +1,7 @@
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import configGlobal from '@/lib/config';
-import { DSLSchema, IDSL, IEdge, IFlowNodeType, INodeType, INodeWithPosition, loadDSL, NodeDSLSchema, EdgeDSLSchema, INodeState, INodeConfig, INodeOutput, INodeInput, dumpDSL, FlowDSLSchema } from '@/lib/flow/flow';
+import { DSLSchema, IDSL, IEdge, IFlowNodeType, INodeType, INodeWithPosition, loadDSL, INodeState, INodeConfig, INodeOutput, INodeInput, dumpDSL } from '@/lib/flow/flow';
 import { reactStream, createExecutableTool, Message, ExecutableTool } from '@/lib/llm';
 import { Editor } from '@monaco-editor/react';
 import { ChevronDown, ChevronRight, Loader, PanelLeftClose, PanelRightClose, Trash2 } from 'lucide-react';
@@ -10,6 +10,7 @@ import { toast } from 'sonner';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { z } from 'zod';
 import MarkdownRenderer from './MarkdownRenderer';
+import { get, set, cloneDeep, unset } from 'lodash';
 
 interface ToolCallComponentProps {
   toolCall: {
@@ -109,9 +110,8 @@ function AICopilotDialog({
   setDSL,
   nodeTypeMap,
   newFlowNodeType,
-  setNodeReviewed,
 }: AICopilotDialogProps) {
-  const [dslString, setDslString] = useState(''); // DSL in code editor
+  const [dslString, setDslString] = useState(() => JSON.stringify(DSL, null, 2)); // DSL in code editor
   const [prompt, setPrompt] = useState('');
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [isShowDSL, setIsShowDSL] = useState(false);
@@ -192,236 +192,65 @@ function AICopilotDialog({
     };
 
     // Define tool parameter schemas
-    const EditNodesParamsSchema = z.object({
-      flowId: z.string().describe('ID of the flow to edit.'),
-      nodes: z.array(NodeDSLSchema).describe('Nodes to create or update')
+    const EditDSLParamsSchema = z.object({
+      operations: z.array(z.object({
+        action: z.enum(['set', 'delete', 'push']).describe('The action to perform: set (add/update), delete, or push (add to array)'),
+        path: z.string().describe('The JSON path to the property (e.g., "flows[0].nodes[1].config.value")'),
+        value: z.any().optional().describe('The value to set or push. Required for set and push actions.')
+      })).describe('List of operations to perform on the DSL')
     });
 
-    const RemoveNodesParamsSchema = z.object({
-      flowId: z.string().describe('ID of the flow to edit.'),
-      nodeIds: z.array(z.string()).describe('IDs of the nodes to remove')
-    });
-
-    const EditEdgesParamsSchema = z.object({
-      flowId: z.string().describe('ID of the flow to edit.'),
-      edges: z.array(EdgeDSLSchema).describe('Edges to create or update')
-    });
-
-    const RemoveEdgesParamsSchema = z.object({
-      flowId: z.string().describe('ID of the flow to edit.'),
-      edgeIds: z.array(z.string()).describe('IDs of the edges to remove')
-    });
-
-    const EditFlowParamsSchema = z.object({
-      flowId: z.string().describe('ID of the flow to edit.'),
-      flow: FlowDSLSchema.describe('Flow to create or update')
-    });
-
-    const RemoveFlowParamsSchema = z.object({
-      flowId: z.string().describe('ID of the flow to remove')
-    });
-
-    const UpdateDSLParamsSchema = z.object({
-      dsl: DSLSchema.describe('Complete DSL to replace the current one')
-    });
-
-    const editNodeTool = createExecutableTool(
-      'edit_nodes',
-      'Create or edit nodes in the flow. If node ID exists, it will be replaced; if not, a new node will be created.',
-      EditNodesParamsSchema,
+    const editDSLTool = createExecutableTool(
+      'edit_dsl',
+      'Edit the DSL by setting, deleting, or pushing values at specific JSON paths. Use this tool for all modifications to the flow structure.',
+      EditDSLParamsSchema,
       async (args) => {
-        const currentDSL = getCurrentDSL();
-        const flowId = args.flowId;
+        const currentDSL = cloneDeep(getCurrentDSL());
 
-        // Find the target flow in the flows array
-        const targetFlow = currentDSL.flows?.find((f: { id: string }) => f.id === flowId);
-        if (!targetFlow) {
-          throw new Error(`Flow with id "${flowId}" not found`);
-        }
+        for (const op of args.operations) {
+          try {
+            if (op.action === 'set') {
+              set(currentDSL, op.path, op.value);
+            } else if (op.action === 'delete') {
+              // 对于数组元素的删除，lodash的unset会留下undefined，需要特殊处理
+              const pathParts = op.path.split(/[.[\]]/).filter(Boolean);
+              const lastPart = pathParts.pop();
+              const parentPath = pathParts.join('.');
 
-        for (const node of args.nodes) {
-          // Find existing node index
-          const existingIndex = targetFlow.nodes.findIndex((n: { id: string }) => n.id === node.id);
-
-          if (existingIndex >= 0) {
-            // Replace existing node
-            targetFlow.nodes[existingIndex] = {
-              ...node,
-              position: node.position || { x: 0, y: 0 }
-            };
-          } else {
-            // Add new node
-            targetFlow.nodes.push({
-              ...node,
-              position: node.position || { x: 0, y: 0 }
-            });
+              if (lastPart && !isNaN(Number(lastPart))) {
+                // 如果是数组索引
+                const parent = parentPath ? get(currentDSL, parentPath) : currentDSL;
+                if (Array.isArray(parent)) {
+                  parent.splice(Number(lastPart), 1);
+                } else {
+                  unset(currentDSL, op.path);
+                }
+              } else {
+                unset(currentDSL, op.path);
+              }
+            } else if (op.action === 'push') {
+              const array = get(currentDSL, op.path);
+              if (Array.isArray(array)) {
+                array.push(op.value);
+              } else {
+                throw new Error(`Path "${op.path}" is not an array`);
+              }
+            }
+          } catch (e: unknown) {
+            const errorMessage = e instanceof Error ? e.message : String(e);
+            throw new Error(`Failed to perform ${op.action} on path "${op.path}": ${errorMessage}`);
           }
         }
-        const result = updateDSLAndEditor(currentDSL, `Nodes "${args.nodes.map((node) => node.id).join(', ')}" updated successfully`);
-        args.nodes.forEach((node) => setNodeReviewed(flowId, node.id, false));
-        return result;
+
+        // 自动重置修改过的节点的 review 状态
+        // 简单的策略：如果路径包含 nodes[index]，则认为该节点被修改
+        // 更复杂的策略需要解析 path
+        // 这里简化处理，每次修改都验证整个DSL
+
+        return updateDSLAndEditor(currentDSL, `DSL updated successfully with ${args.operations.length} operations`);
       }
     );
 
-    const removeNodeTool = createExecutableTool(
-      'remove_nodes',
-      'Remove nodes from the flow and all their connected edges',
-      RemoveNodesParamsSchema,
-      async (args) => {
-        const currentDSL = getCurrentDSL();
-        const flowId = args.flowId;
-
-        // Find the target flow in the flows array
-        const targetFlow = currentDSL.flows?.find((f: { id: string }) => f.id === flowId);
-        if (!targetFlow) {
-          throw new Error(`Flow with id "${flowId}" not found`);
-        }
-
-        for (const nodeId of args.nodeIds) {
-          // Find and remove the node
-          const nodeIndex = targetFlow.nodes.findIndex((n: { id: string }) => n.id === nodeId);
-          if (nodeIndex === -1) {
-            throw new Error(`Node with id "${nodeId}" not found`);
-          }
-
-          targetFlow.nodes.splice(nodeIndex, 1);
-
-          // Remove all edges connected to this node
-          targetFlow.edges = targetFlow.edges.filter((e: { source: { nodeId: string }, target: { nodeId: string } }) =>
-            e.source.nodeId !== nodeId && e.target.nodeId !== nodeId
-          );
-        }
-
-        return updateDSLAndEditor(currentDSL, `Nodes "${args.nodeIds.join(', ')}" and their connected edges removed successfully`);
-      }
-    );
-
-    const editEdgeTool = createExecutableTool(
-      'edit_edges',
-      'Create or edit edges in the flow. If edge ID exists, it will be replaced; if not, a new edge will be created.',
-      EditEdgesParamsSchema,
-      async (args) => {
-        const currentDSL = getCurrentDSL();
-        const flowId = args.flowId;
-
-        // Find the target flow in the flows array
-        const targetFlow = currentDSL.flows?.find((f: { id: string }) => f.id === flowId);
-        if (!targetFlow) {
-          throw new Error(`Flow with id "${flowId}" not found`);
-        }
-
-        for (const edge of args.edges) {
-          // Find existing edge index
-          const existingIndex = targetFlow.edges.findIndex((e: { id: string }) => e.id === edge.id);
-
-          if (existingIndex >= 0) {
-            // Replace existing edge
-            targetFlow.edges[existingIndex] = edge;
-          } else {
-            // Add new edge
-            targetFlow.edges.push(edge);
-          }
-        }
-        const result = updateDSLAndEditor(currentDSL, `Edges "${args.edges.map((edge) => edge.id).join(', ')}" updated successfully`);
-        return result;
-      }
-    );
-
-    // Create the remove_edge tool
-    const removeEdgeTool = createExecutableTool(
-      'remove_edge',
-      'Remove edges from the flow',
-      RemoveEdgesParamsSchema,
-      async (args) => {
-        const currentDSL = getCurrentDSL();
-        const flowId = args.flowId;
-
-        // Find the target flow in the flows array
-        const targetFlow = currentDSL.flows?.find((f: { id: string }) => f.id === flowId);
-        if (!targetFlow) {
-          throw new Error(`Flow with id "${flowId}" not found`);
-        }
-
-        for (const edgeId of args.edgeIds) {
-          // Find and remove the edge
-          const edgeIndex = targetFlow.edges.findIndex((e: { id: string }) => e.id === edgeId);
-          if (edgeIndex === -1) {
-            throw new Error(`Edge with id "${edgeId}" not found`);
-          }
-
-          targetFlow.edges.splice(edgeIndex, 1);
-        }
-
-        return updateDSLAndEditor(currentDSL, `Edge "${args.edgeIds.join(', ')}" removed successfully`);
-      }
-    );
-
-    const editFlowTool = createExecutableTool(
-      'edit_flow',
-      'Create or edit a flow in the DSL',
-      EditFlowParamsSchema,
-      async (args) => {
-        const currentDSL = getCurrentDSL();
-        const flowId = args.flowId;
-
-        // Find the target flow
-        const targetFlowIndex = currentDSL.flows?.findIndex((f: { id: string }) => f.id === flowId);
-        if (targetFlowIndex !== undefined && targetFlowIndex >= 0) {
-          // Replace existing flow
-          currentDSL.flows[targetFlowIndex] = {
-            ...args.flow,
-            nodes: args.flow.nodes.map(node => ({
-              ...node,
-              position: node.position || { x: 0, y: 0 }
-            }))
-          };
-          const result = updateDSLAndEditor(currentDSL, `Flow "${args.flow.id}" updated successfully`);
-          args.flow.nodes.forEach((node) => setNodeReviewed(flowId, node.id, false));
-          return result;
-        } else {
-          // Add new flow
-          currentDSL.flows.push({
-            ...args.flow,
-            nodes: args.flow.nodes.map(node => ({
-              ...node,
-              position: node.position || { x: 0, y: 0 }
-            }))
-          });
-          const result = updateDSLAndEditor(currentDSL, `Flow "${args.flow.id}" created successfully`);
-          args.flow.nodes.forEach((node) => setNodeReviewed(flowId, node.id, false));
-          return result;
-        }
-      }
-    );
-
-    const removeFlowTool = createExecutableTool(
-      'remove_flow',
-      'Remove a flow from the DSL',
-      RemoveFlowParamsSchema,
-      async (args) => {
-        const currentDSL = getCurrentDSL();
-        const flowId = args.flowId;
-
-        // Find the target flow
-        const targetFlowIndex = currentDSL.flows?.findIndex((f: { id: string }) => f.id === flowId);
-        if (targetFlowIndex !== undefined && targetFlowIndex >= 0) {
-          currentDSL.flows.splice(targetFlowIndex, 1);
-          return updateDSLAndEditor(currentDSL, `Flow "${args.flowId}" removed successfully`);
-        }
-        throw new Error(`Flow with id "${args.flowId}" not found`);
-      }
-    );
-
-    const updateDSLTool = createExecutableTool(
-      'update_dsl',
-      'Update the current flow DSL with a new or modified DSL',
-      UpdateDSLParamsSchema,
-      async (args) => {
-        const result = updateDSLAndEditor(args.dsl, 'DSL updated successfully');
-        args.dsl.flows?.forEach((flow) => flow.nodes.forEach((node) => setNodeReviewed(flow.id, node.id, false)));
-        return result;
-      }
-    );
 
     const systemPrompt = `You are an expert AI assistant for collaboratively building visual application flows.
 Your primary role is to help users analyze, create, and modify these flows based on their instructions and the provided DSL context.
@@ -444,9 +273,10 @@ Use the user's language for explanations and diagrams, but must keep all paramet
 
 # Tool Usage Guidelines
 - All tool calls must generate a valid format that strictly follows the provided schema and rules. Ensure all node/edge IDs are unique and connections are valid.
-- For small, targeted modifications (e.g., editing one node's config, adding a single edge), prefer specific tools like edit_node or add_edge.
-- For creating a whole new flow or making large-scale changes, the update_dsl and edit_flow tool is appropriate.
-- Always choose the appropriate tools to make the changes shorter, concise, clear and faster. For example, if you want to add lots of nodes and edges, you should use the update_dsl or edit_flow tool.
+- Use the 'edit_dsl' tool for ALL modifications to the flow structure. This tool allows you to perform 'set', 'delete', or 'push' operations on specific JSON paths within the DSL.
+- Construct JSON paths carefully to target the correct elements (e.g., 'flows[0].nodes' to access nodes of the first flow).
+- You can perform multiple operations in a single 'edit_dsl' call to ensure atomicity and efficiency.
+- Prefer operating at higher levels of the JSON structure to minimize the number of operations. For example, instead of pushing nodes one by one to 'flows[0].nodes', construct the entire array of new nodes and push them all at once or set 'flows[0].nodes' directly if replacing.
 - Stop calling tools only when the target is reached or you need help.
 
 
@@ -472,6 +302,7 @@ All changes must ensure the DSL:
 - A node can connect to zero or more input/output edges through handles, every handle has a unique key, which is defined strictly by the node type input/output schema or dynamically by the node config
 - Every output handle of a node (source of an edge) can connect to multiple input handles (targets of edges), but every input handle can only connect to one output handle (except the end node)
 - For some node types, the input/output handles are dynamic, you must make sure the handle keys are valid
+- You don't need to worry about the node position, the system will automatically layout the nodes after update.
 
 ## Edge Structure
 - An edge has a unique id, a source and a target
@@ -535,13 +366,7 @@ ${JSON.stringify(zodToJsonSchema(nodeType.configSchema, { name: nodeType.id, $re
 
       // Use reactStream function with tools to get streaming events
       const eventStream = reactStream(configGlobal.codeEditorModel, messages, [
-        editNodeTool,
-        removeNodeTool,
-        editEdgeTool,
-        removeEdgeTool,
-        editFlowTool,
-        removeFlowTool,
-        updateDSLTool,
+        editDSLTool,
       ] as unknown as ExecutableTool<Record<string, unknown>>[], 10);
 
       for await (const event of eventStream) {
