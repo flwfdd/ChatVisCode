@@ -2,6 +2,7 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import configGlobal from '@/lib/config';
 import { DSLSchema, IDSL, IEdge, IFlowNodeType, INodeType, INodeWithPosition, loadDSL, INodeState, INodeConfig, INodeOutput, INodeInput, dumpDSL } from '@/lib/flow/flow';
+import { applyPatch, type Operation as JsonPatchOperation } from 'fast-json-patch';
 import parseJson from 'json-parse-even-better-errors';
 import { reactStream, createExecutableTool, Message, ExecutableTool } from '@/lib/llm';
 import { Editor } from '@monaco-editor/react';
@@ -11,7 +12,7 @@ import { toast } from 'sonner';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { z } from 'zod';
 import MarkdownRenderer from './MarkdownRenderer';
-import { set, cloneDeep, unset } from 'lodash';
+import { cloneDeep } from 'lodash';
 
 interface ToolCallComponentProps {
   toolCall: {
@@ -82,13 +83,11 @@ interface ChatMessage extends Message {
   timestamp: number;
 }
 
-interface EditDSLOperation {
-  action: 'set' | 'delete';
-  path: string;
-  value?: unknown;
+function decodeJsonPointerSegment(segment: string) {
+  return segment.replace(/~1/g, '/').replace(/~0/g, '~');
 }
 
-function collectReviewedTargets(operations: EditDSLOperation[], dsl: IDSL) {
+function collectReviewedTargetsFromPatch(operations: JsonPatchOperation[], dsl: IDSL) {
   const targets = new Map<string, { flowId: string; nodeId: string }>();
 
   const addFlowNodes = (flowId: string) => {
@@ -101,21 +100,52 @@ function collectReviewedTargets(operations: EditDSLOperation[], dsl: IDSL) {
   };
 
   operations.forEach(({ path }) => {
-    const flowMatch = path.match(/^flows\.([^.]+)(?:\.|$)/);
-    if (!flowMatch) return;
+    const segments = path
+      .split('/')
+      .slice(1)
+      .map(decodeJsonPointerSegment);
 
-    const flowId = flowMatch[1];
-    const nodeMatch = path.match(/^flows\.([^.]+)\.nodes(?:\.([^.]+))?(?:\.|$)/);
+    if (segments.length < 2 || segments[0] !== 'flows') return;
 
-    if (nodeMatch?.[2]) {
-      const nodeId = nodeMatch[2];
-      if (dsl.flows[flowId]?.nodes[nodeId]) {
-        targets.set(`${flowId}:${nodeId}`, { flowId, nodeId });
+    const flowId = segments[1];
+    const flow = dsl.flows[flowId];
+    if (!flow) return;
+
+    if (segments.length === 2) {
+      addFlowNodes(flowId);
+      return;
+    }
+
+    const scope = segments[2];
+
+    if (scope === 'nodes') {
+      const nodeId = segments[3];
+      if (nodeId) {
+        if (flow.nodes[nodeId]) {
+          targets.set(`${flowId}:${nodeId}`, { flowId, nodeId });
+        }
+      } else {
+        addFlowNodes(flowId);
       }
       return;
     }
 
-    if (path === `flows.${flowId}` || path === `flows.${flowId}.nodes`) {
+    if (scope === 'edges') {
+      const edgeId = segments[3];
+      if (edgeId && flow.edges[edgeId]) {
+        const edge = flow.edges[edgeId];
+        const sourceNodeId = edge.source?.nodeId;
+        const targetNodeId = edge.target?.nodeId;
+
+        if (sourceNodeId && flow.nodes[sourceNodeId]) {
+          targets.set(`${flowId}:${sourceNodeId}`, { flowId, nodeId: sourceNodeId });
+        }
+        if (targetNodeId && flow.nodes[targetNodeId]) {
+          targets.set(`${flowId}:${targetNodeId}`, { flowId, nodeId: targetNodeId });
+        }
+        return;
+      }
+
       addFlowNodes(flowId);
     }
   });
@@ -211,11 +241,11 @@ function AICopilotDialog({
     };
 
     // Helper function to update DSL and editor
-    const updateDSLAndEditor = (newDSL: unknown, successMessage: string, operations: EditDSLOperation[] = []) => {
+    const updateDSLAndEditor = (newDSL: unknown, successMessage: string, operations: JsonPatchOperation[] = []) => {
       try {
         const validatedDSL = loadDSL(newDSL, nodeTypeMap, newFlowNodeType);
         const normalizedDSL = dumpDSL(validatedDSL);
-        const reviewedTargets = collectReviewedTargets(operations, normalizedDSL);
+        const reviewedTargets = collectReviewedTargetsFromPatch(operations, normalizedDSL);
 
         dslRef.current = normalizedDSL;
 
@@ -241,36 +271,35 @@ function AICopilotDialog({
       }
     };
 
-    // Define tool parameter schemas
-    const EditDSLParamsSchema = z.object({
-      operations: z.array(z.object({
-        action: z.enum(['set', 'delete']).describe('The action to perform: set (add/update) or delete'),
-        path: z.string().describe('The JSON path to the property (e.g., "flows.flow_1.nodes.node_1.config.value")'),
-        value: z.any().optional().describe('The value to set. Required for set action.')
-      })).describe('List of operations to perform on the DSL')
+    const JsonPatchOpSchema = z.object({
+      op: z.enum(['add', 'remove', 'replace', 'move', 'copy', 'test']).describe('JSON Patch operation'),
+      path: z.string().startsWith('/').describe('JSON Pointer path, e.g. /flows/flow_main/nodes/node_1/config/name'),
+      from: z.string().optional().describe('Source path for move/copy operations'),
+      value: z.any().optional().describe('Value for add/replace/test operations'),
     });
 
-    const editDSLTool = createExecutableTool(
-      'edit_dsl',
-      'Edit the DSL by setting or deleting values at specific JSON paths. Use this tool for all modifications to the flow structure.',
-      EditDSLParamsSchema,
+    const StructuredEditArgsSchema = z.union([
+      z.array(JsonPatchOpSchema).describe('JSON Patch operations array'),
+      z.object({
+        patch: z.array(JsonPatchOpSchema).describe('JSON Patch operations array'),
+      }),
+    ]);
+
+    const structuredEditTool = createExecutableTool(
+      'structured_edit',
+      'Apply RFC 6902 JSON Patch operations to the DSL. Use this tool for all modifications to the flow structure.',
+      StructuredEditArgsSchema,
       async (args) => {
+        const patch = (Array.isArray(args) ? args : args.patch) as unknown as JsonPatchOperation[];
+
         const currentDSL = cloneDeep(getCurrentDSL());
+        const result = applyPatch(currentDSL, patch, true, true, true);
 
-        for (const op of args.operations) {
-          try {
-            if (op.action === 'set') {
-              set(currentDSL, op.path, op.value);
-            } else {
-              unset(currentDSL, op.path);
-            }
-          } catch (e: unknown) {
-            const errorMessage = e instanceof Error ? e.message : String(e);
-            throw new Error(`Failed to perform ${op.action} on path "${op.path}": ${errorMessage}`);
-          }
-        }
-
-        return updateDSLAndEditor(currentDSL, `DSL updated successfully with ${args.operations.length} operations`, args.operations);
+        return updateDSLAndEditor(
+          result.newDocument,
+          `DSL patched successfully with ${patch.length} operations`,
+          patch
+        );
       }
     );
 
@@ -296,14 +325,24 @@ Use the user's language for explanations and diagrams, but must keep all paramet
 
 # Tool Usage Guidelines
 - All tool calls must generate a valid format that strictly follows the provided schema and rules. Ensure all node/edge IDs are unique and connections are valid.
-- Use the 'edit_dsl' tool for ALL modifications to the flow structure. This tool allows you to perform 'set' or 'delete' operations on specific JSON paths within the DSL.
+- Use the 'structured_edit' tool for ALL modifications to the flow structure. This tool applies RFC 6902 JSON Patch operations.
 - **IMPORTANT: The DSL structure uses dictionaries (Objects) for flows, nodes, and edges, NOT arrays.**
-  - Access flows via 'flows.{flowId}'
-  - Access nodes via 'flows.{flowId}.nodes.{nodeId}'
-  - Access edges via 'flows.{flowId}.edges.{edgeId}'
-- Construct JSON paths carefully to target the correct elements.
-- You can perform multiple operations in a single 'edit_dsl' call to ensure atomicity and efficiency.
-- **Efficiency Tip**: Prefer operating at higher levels of the JSON structure to minimize the number of operations. For example, instead of setting nodes one by one, construct the entire dictionary of new nodes and set 'flows.{flowId}.nodes' directly if replacing.
+  - Use JSON Pointer paths like '/flows/flow_main/nodes/node_1/config/name'
+  - Flows: '/flows/{flowId}'
+  - Nodes: '/flows/{flowId}/nodes/{nodeId}'
+  - Edges: '/flows/{flowId}/edges/{edgeId}'
+- Example JSON Patch:
+  \`\`\`json
+  [
+    {
+      "op": "replace",
+      "path": "/flows/flow_main/nodes/deep_research_agent/config/model",
+      "value": "kimi"
+    }
+  ]
+  \`\`\`
+- You can perform multiple patch operations in a single 'structured_edit' call to ensure atomicity and efficiency.
+- Prefer higher-level patches when possible. For example, replace the entire '/flows/{flowId}/nodes' object in one operation instead of many per-node operations.
 - Stop calling tools only when the target is reached or you need help.
 
 
@@ -393,7 +432,7 @@ ${JSON.stringify(zodToJsonSchema(nodeType.configSchema, { name: nodeType.id, $re
 
       // Use reactStream function with tools to get streaming events
       const eventStream = reactStream(configGlobal.codeEditorModel, messages, [
-        editDSLTool,
+        structuredEditTool,
       ] as unknown as ExecutableTool<Record<string, unknown>>[], 10);
 
       for await (const event of eventStream) {
