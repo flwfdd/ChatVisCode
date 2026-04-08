@@ -82,6 +82,47 @@ interface ChatMessage extends Message {
   timestamp: number;
 }
 
+interface EditDSLOperation {
+  action: 'set' | 'delete';
+  path: string;
+  value?: unknown;
+}
+
+function collectReviewedTargets(operations: EditDSLOperation[], dsl: IDSL) {
+  const targets = new Map<string, { flowId: string; nodeId: string }>();
+
+  const addFlowNodes = (flowId: string) => {
+    const flow = dsl.flows[flowId];
+    if (!flow) return;
+
+    Object.keys(flow.nodes).forEach((nodeId) => {
+      targets.set(`${flowId}:${nodeId}`, { flowId, nodeId });
+    });
+  };
+
+  operations.forEach(({ path }) => {
+    const flowMatch = path.match(/^flows\.([^.]+)(?:\.|$)/);
+    if (!flowMatch) return;
+
+    const flowId = flowMatch[1];
+    const nodeMatch = path.match(/^flows\.([^.]+)\.nodes(?:\.([^.]+))?(?:\.|$)/);
+
+    if (nodeMatch?.[2]) {
+      const nodeId = nodeMatch[2];
+      if (dsl.flows[flowId]?.nodes[nodeId]) {
+        targets.set(`${flowId}:${nodeId}`, { flowId, nodeId });
+      }
+      return;
+    }
+
+    if (path === `flows.${flowId}` || path === `flows.${flowId}.nodes`) {
+      addFlowNodes(flowId);
+    }
+  });
+
+  return Array.from(targets.values());
+}
+
 
 function tagContext(dslStr: string, dslErr: string) {
   return `<DSL Context>
@@ -111,6 +152,7 @@ function AICopilotDialog({
   setDSL,
   nodeTypeMap,
   newFlowNodeType,
+  setNodeReviewed,
 }: AICopilotDialogProps) {
   const [dslString, setDslString] = useState(() => JSON.stringify(DSL, null, 2)); // DSL in code editor
   const [prompt, setPrompt] = useState('');
@@ -169,18 +211,25 @@ function AICopilotDialog({
     };
 
     // Helper function to update DSL and editor
-    const updateDSLAndEditor = (newDSL: unknown, successMessage: string) => {
+    const updateDSLAndEditor = (newDSL: unknown, successMessage: string, operations: EditDSLOperation[] = []) => {
       try {
-        // 验证 DSL
         const validatedDSL = loadDSL(newDSL, nodeTypeMap, newFlowNodeType);
+        const normalizedDSL = dumpDSL(validatedDSL);
+        const reviewedTargets = collectReviewedTargets(operations, normalizedDSL);
 
-        // 同步更新 ref，供下一次工具调用使用
-        dslRef.current = newDSL as IDSL;
+        dslRef.current = normalizedDSL;
 
-        // 异步更新 state，用于 UI 渲染和父组件通信
-        const newDSLStr = JSON.stringify(newDSL, null, 2);
+        const newDSLStr = JSON.stringify(normalizedDSL, null, 2);
         setDslString(newDSLStr);
-        setDSL(dumpDSL(validatedDSL));
+        setDSL(normalizedDSL);
+
+        if (reviewedTargets.length > 0) {
+          window.setTimeout(() => {
+            reviewedTargets.forEach(({ flowId, nodeId }) => {
+              setNodeReviewed(flowId, nodeId, false);
+            });
+          }, 200);
+        }
 
         toast.success(successMessage);
         return successMessage + ' The flow has been validated and applied.' + '\n\n' + tagContext(newDSLStr, '');
@@ -212,10 +261,8 @@ function AICopilotDialog({
           try {
             if (op.action === 'set') {
               set(currentDSL, op.path, op.value);
-            } else if (op.action === 'delete') {
+            } else {
               unset(currentDSL, op.path);
-            } else if (op.action === 'push') {
-              throw new Error(`Action "push" is not supported for dictionary structure. Use "set" to add new items.`);
             }
           } catch (e: unknown) {
             const errorMessage = e instanceof Error ? e.message : String(e);
@@ -223,12 +270,7 @@ function AICopilotDialog({
           }
         }
 
-        // 自动重置修改过的节点的 review 状态
-        // 简单的策略：如果路径包含 nodes[index]，则认为该节点被修改
-        // 更复杂的策略需要解析 path
-        // 这里简化处理，每次修改都验证整个DSL
-
-        return updateDSLAndEditor(currentDSL, `DSL updated successfully with ${args.operations.length} operations`);
+        return updateDSLAndEditor(currentDSL, `DSL updated successfully with ${args.operations.length} operations`, args.operations);
       }
     );
 
