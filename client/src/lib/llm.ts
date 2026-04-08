@@ -3,6 +3,7 @@ import config from "./config";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { FunctionParameters } from "openai/resources/shared.mjs";
+import parseJson from 'json-parse-even-better-errors';
 
 // 初始化OpenAI
 const openai = new OpenAI({
@@ -352,7 +353,7 @@ export async function* reactStream(
                     throw new Error(`Unknown tool: ${toolCall.name}`);
                 }
 
-                const args = JSON.parse(toolCall.arguments);
+                const args = parseJson(toolCall.arguments);
 
                 // 使用类型安全的工具调用处理
                 const handler = createToolCallHandler(tool);

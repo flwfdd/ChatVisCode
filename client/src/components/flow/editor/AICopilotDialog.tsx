@@ -2,6 +2,7 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import configGlobal from '@/lib/config';
 import { DSLSchema, IDSL, IEdge, IFlowNodeType, INodeType, INodeWithPosition, loadDSL, INodeState, INodeConfig, INodeOutput, INodeInput, dumpDSL } from '@/lib/flow/flow';
+import parseJson from 'json-parse-even-better-errors';
 import { reactStream, createExecutableTool, Message, ExecutableTool } from '@/lib/llm';
 import { Editor } from '@monaco-editor/react';
 import { ChevronDown, ChevronRight, Loader, PanelLeftClose, PanelRightClose, Trash2 } from 'lucide-react';
@@ -10,7 +11,7 @@ import { toast } from 'sonner';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { z } from 'zod';
 import MarkdownRenderer from './MarkdownRenderer';
-import { get, set, cloneDeep, unset } from 'lodash';
+import { set, cloneDeep, unset } from 'lodash';
 
 interface ToolCallComponentProps {
   toolCall: {
@@ -133,17 +134,17 @@ function AICopilotDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]); // DSL更新时不能重置状态
 
-  // 当外部 DSL prop 变化时，同步更新 ref 和编辑器状态
+  // Sync ref and editor state when external DSL prop changes
   useEffect(() => {
     if (isOpen) {
       setDslString(JSON.stringify(DSL, null, 2));
     }
-  }, [DSL, isOpen]) // 更新
+  }, [DSL, isOpen]);
 
   // Check the DSL
   useEffect(() => {
     try {
-      const parsedDSL = JSON.parse(dslString);
+      const parsedDSL = parseJson(dslString);
       dslRef.current = dumpDSL(loadDSL(parsedDSL, nodeTypeMap, newFlowNodeType));
       setDslError('');
     } catch (error: unknown) {
@@ -194,15 +195,15 @@ function AICopilotDialog({
     // Define tool parameter schemas
     const EditDSLParamsSchema = z.object({
       operations: z.array(z.object({
-        action: z.enum(['set', 'delete', 'push']).describe('The action to perform: set (add/update), delete, or push (add to array)'),
-        path: z.string().describe('The JSON path to the property (e.g., "flows[0].nodes[1].config.value")'),
-        value: z.any().optional().describe('The value to set or push. Required for set and push actions.')
+        action: z.enum(['set', 'delete']).describe('The action to perform: set (add/update) or delete'),
+        path: z.string().describe('The JSON path to the property (e.g., "flows.flow_1.nodes.node_1.config.value")'),
+        value: z.any().optional().describe('The value to set. Required for set action.')
       })).describe('List of operations to perform on the DSL')
     });
 
     const editDSLTool = createExecutableTool(
       'edit_dsl',
-      'Edit the DSL by setting, deleting, or pushing values at specific JSON paths. Use this tool for all modifications to the flow structure.',
+      'Edit the DSL by setting or deleting values at specific JSON paths. Use this tool for all modifications to the flow structure.',
       EditDSLParamsSchema,
       async (args) => {
         const currentDSL = cloneDeep(getCurrentDSL());
@@ -212,29 +213,9 @@ function AICopilotDialog({
             if (op.action === 'set') {
               set(currentDSL, op.path, op.value);
             } else if (op.action === 'delete') {
-              // 对于数组元素的删除，lodash的unset会留下undefined，需要特殊处理
-              const pathParts = op.path.split(/[.[\]]/).filter(Boolean);
-              const lastPart = pathParts.pop();
-              const parentPath = pathParts.join('.');
-
-              if (lastPart && !isNaN(Number(lastPart))) {
-                // 如果是数组索引
-                const parent = parentPath ? get(currentDSL, parentPath) : currentDSL;
-                if (Array.isArray(parent)) {
-                  parent.splice(Number(lastPart), 1);
-                } else {
-                  unset(currentDSL, op.path);
-                }
-              } else {
-                unset(currentDSL, op.path);
-              }
+              unset(currentDSL, op.path);
             } else if (op.action === 'push') {
-              const array = get(currentDSL, op.path);
-              if (Array.isArray(array)) {
-                array.push(op.value);
-              } else {
-                throw new Error(`Path "${op.path}" is not an array`);
-              }
+              throw new Error(`Action "push" is not supported for dictionary structure. Use "set" to add new items.`);
             }
           } catch (e: unknown) {
             const errorMessage = e instanceof Error ? e.message : String(e);
@@ -273,10 +254,14 @@ Use the user's language for explanations and diagrams, but must keep all paramet
 
 # Tool Usage Guidelines
 - All tool calls must generate a valid format that strictly follows the provided schema and rules. Ensure all node/edge IDs are unique and connections are valid.
-- Use the 'edit_dsl' tool for ALL modifications to the flow structure. This tool allows you to perform 'set', 'delete', or 'push' operations on specific JSON paths within the DSL.
-- Construct JSON paths carefully to target the correct elements (e.g., 'flows[0].nodes' to access nodes of the first flow).
+- Use the 'edit_dsl' tool for ALL modifications to the flow structure. This tool allows you to perform 'set' or 'delete' operations on specific JSON paths within the DSL.
+- **IMPORTANT: The DSL structure uses dictionaries (Objects) for flows, nodes, and edges, NOT arrays.**
+  - Access flows via 'flows.{flowId}'
+  - Access nodes via 'flows.{flowId}.nodes.{nodeId}'
+  - Access edges via 'flows.{flowId}.edges.{edgeId}'
+- Construct JSON paths carefully to target the correct elements.
 - You can perform multiple operations in a single 'edit_dsl' call to ensure atomicity and efficiency.
-- Prefer operating at higher levels of the JSON structure to minimize the number of operations. For example, instead of pushing nodes one by one to 'flows[0].nodes', construct the entire array of new nodes and push them all at once or set 'flows[0].nodes' directly if replacing.
+- **Efficiency Tip**: Prefer operating at higher levels of the JSON structure to minimize the number of operations. For example, instead of setting nodes one by one, construct the entire dictionary of new nodes and set 'flows.{flowId}.nodes' directly if replacing.
 - Stop calling tools only when the target is reached or you need help.
 
 
@@ -524,7 +509,7 @@ ${JSON.stringify(zodToJsonSchema(nodeType.configSchema, { name: nodeType.id, $re
   const handleSave = () => {
     try {
       // Parse the current DSL string in the editor
-      const parsedDSL = JSON.parse(dslString);
+      const parsedDSL = parseJson(dslString);
 
       // Try to load the DSL to validate it
       try {
@@ -539,8 +524,9 @@ ${JSON.stringify(zodToJsonSchema(nodeType.configSchema, { name: nodeType.id, $re
         const errorMessage = validationError instanceof Error ? validationError.message : String(validationError);
         toast.error('DSL validation failed: ' + errorMessage);
       }
-    } catch {
-      toast.error('JSON parsing failed, please check the format');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      toast.error('JSON parsing failed: ' + errorMessage);
     }
   };
 
@@ -551,7 +537,7 @@ ${JSON.stringify(zodToJsonSchema(nodeType.configSchema, { name: nodeType.id, $re
 
     // Parse and apply the snapshot to restore the original flow
     try {
-      const snapshotDSL = JSON.parse(dslSnapshot);
+      const snapshotDSL = parseJson(dslSnapshot);
       setDSL(snapshotDSL);
     } catch (error) {
       console.error('Failed to restore DSL snapshot:', error);

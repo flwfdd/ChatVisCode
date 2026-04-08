@@ -483,15 +483,15 @@ export const FlowDSLSchema = z.object({
   id: z.string(),
   name: z.string(),
   description: z.string(),
-  nodes: NodeDSLSchema.array(),
-  edges: EdgeDSLSchema.array(),
+  nodes: z.record(NodeDSLSchema).describe('Key is node ID'),
+  edges: z.record(EdgeDSLSchema).describe('Key is edge ID'),
 });
 export type IFlowDSL = z.infer<typeof FlowDSLSchema>;
 
 // 导出 DSL Schema
 export const DSLSchema = z.object({
   mainFlowId: z.string().describe('ID of the main flow to run and show in the UI.'),
-  flows: FlowDSLSchema.array().describe('All flows in the project.'),
+  flows: z.record(FlowDSLSchema).describe('All flows in the project. Key is flow ID'),
 });
 export type IDSL = z.infer<typeof DSLSchema>;
 
@@ -511,17 +511,18 @@ export function dumpFlow(input: IFlow): IFlowDSL {
     }
   });
 
-  return {
-    id: input.id,
-    name: input.name,
-    description: input.description,
-    nodes: input.nodes.map((node) => ({
+  const nodes = input.nodes.reduce<Record<string, z.infer<typeof NodeDSLSchema>>>((acc, node) => {
+    acc[node.id] = {
       id: node.id,
       type: node.type.id,
       position: node.position,
       config: node.config,
-    })),
-    edges: input.edges.map((edge) => ({
+    };
+    return acc;
+  }, {});
+
+  const edges = input.edges.reduce<Record<string, z.infer<typeof EdgeDSLSchema>>>((acc, edge) => {
+    acc[edge.id] = {
       id: edge.id,
       source: {
         nodeId: edge.source.node.id,
@@ -531,7 +532,16 @@ export function dumpFlow(input: IFlow): IFlowDSL {
         nodeId: edge.target.node.id,
         key: edge.target.key,
       },
-    })),
+    };
+    return acc;
+  }, {});
+
+  return {
+    id: input.id,
+    name: input.name,
+    description: input.description,
+    nodes,
+    edges,
   }
 }
 
@@ -543,9 +553,14 @@ interface IDumpDSLIO {
 
 // 导出完整工程DSL
 export function dumpDSL(input: IDumpDSLIO): IDSL {
+  const flows = input.flowNodeTypes.reduce<Record<string, IFlowDSL>>((acc, flow) => {
+    acc[flow.id] = dumpFlow(flow);
+    return acc;
+  }, {});
+
   return {
     mainFlowId: input.mainFlowId,
-    flows: input.flowNodeTypes.map(dumpFlow),
+    flows,
   }
 }
 
@@ -570,37 +585,7 @@ function loadFlow(
     }
   }
 
-  // 检查节点ID是否重复
-  const nodeIds = new Set<string>();
-  const duplicateNodeIds = new Set<string>();
-  dsl.nodes.forEach(node => {
-    if (nodeIds.has(node.id)) {
-      duplicateNodeIds.add(node.id);
-    } else {
-      nodeIds.add(node.id);
-    }
-  });
-
-  if (duplicateNodeIds.size > 0) {
-    throw new Error(`Duplicate node IDs found: ${Array.from(duplicateNodeIds).join(', ')}`);
-  }
-
-  // 检查边ID是否重复
-  const edgeIds = new Set<string>();
-  const duplicateEdgeIds = new Set<string>();
-  dsl.edges.forEach(edge => {
-    if (edgeIds.has(edge.id)) {
-      duplicateEdgeIds.add(edge.id);
-    } else {
-      edgeIds.add(edge.id);
-    }
-  });
-
-  if (duplicateEdgeIds.size > 0) {
-    throw new Error(`Duplicate edge IDs found: ${Array.from(duplicateEdgeIds).join(', ')}`);
-  }
-
-  const nodes = dsl.nodes.map((nodeDSL) => {
+  const nodes = Object.values(dsl.nodes).map((nodeDSL) => {
     const nodeType = nodeTypeMap[nodeDSL.type];
     if (!nodeType) {
       throw new Error(`Unknown node type "${nodeDSL.type}".`);
@@ -630,8 +615,10 @@ function loadFlow(
     return newNode;
   });
 
+  const nodeIds = new Set(Object.keys(dsl.nodes));
+
   // 预先验证所有边的引用
-  for (const edgeDSL of dsl.edges) {
+  for (const edgeDSL of Object.values(dsl.edges)) {
     // 检查源节点是否存在
     if (!nodeIds.has(edgeDSL.source.nodeId)) {
       throw new Error(`Edge "${edgeDSL.id}" references non-existent source node "${edgeDSL.source.nodeId}".`);
@@ -648,7 +635,7 @@ function loadFlow(
   const targetConnectionPoints = new Map<string, string>(); // 格式: "nodeId:key" -> edgeId
   const duplicateTargets = new Set<string>();
 
-  for (const edgeDSL of dsl.edges) {
+  for (const edgeDSL of Object.values(dsl.edges)) {
     if (edgeDSL.target.nodeId === "end") {
       continue;
     }
@@ -670,7 +657,7 @@ function loadFlow(
     throw new Error(`Multiple edges connect to the same input: ${details}. Each input connection point can only connect one edge.`);
   }
 
-  const edges = dsl.edges.map((edgeDSL) => {
+  const edges = Object.values(dsl.edges).map((edgeDSL) => {
     const sourceNode = nodes.find(n => n.id === edgeDSL.source.nodeId);
     const targetNode = nodes.find(n => n.id === edgeDSL.target.nodeId);
     if (!sourceNode || !targetNode) {
@@ -762,18 +749,18 @@ export function loadDSL(
     }
   }
   // 检查主流程ID是否包含在flows中
-  if (!dsl.flows.some(flow => flow.id === dsl.mainFlowId)) {
+  if (!dsl.flows[dsl.mainFlowId]) {
     throw new Error(`Main flow ID "${dsl.mainFlowId}" not found in flows`);
   }
   // 构建流类型映射 节点和边先留空避免循环依赖
-  const flowNodeTypeMap = dsl.flows.reduce<Record<string, IFlowNodeType>>((acc, flow) => {
+  const flowNodeTypeMap = Object.values(dsl.flows).reduce<Record<string, IFlowNodeType>>((acc, flow) => {
     const flowNodeType = newFlowNodeType(flow.id, flow.name, flow.description, [], []);
     acc[flowNodeType.id] = flowNodeType;
     return acc;
   }, {});
   const allNodeTypeMap = { ...nodeTypeMap, ...flowNodeTypeMap } as INodeTypeMap;
   // 注入子流类型的节点和边
-  const flows = dsl.flows.map(flow => loadFlow(flow, allNodeTypeMap));
+  const flows = Object.values(dsl.flows).map(flow => loadFlow(flow, allNodeTypeMap));
   flows.forEach(flow => {
     const flowNodeType = flowNodeTypeMap[flow.id];
     flowNodeType.nodes = flow.nodes;
